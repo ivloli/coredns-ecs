@@ -1,0 +1,19 @@
+[Unit]
+Description=CoreDNS ECS instance %i
+Documentation=https://coredns.io
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/coredns-ecs -conf /etc/coredns-ecs/%i/Corefile
+WorkingDirectory=/etc/coredns-ecs/%i
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coredns-ecs@%i
+
+[Install]
+WantedBy=multi-user.target

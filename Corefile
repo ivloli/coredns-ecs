@@ -1,0 +1,19 @@
+. {
+    ecs_normalizer {
+        ip2region_db  data/ip2region/ip2region_v4.xdb   # 相对于运行目录（项目根）
+        nacos_addr    localhost:8848
+        # nacos_namespace 不写 = public 命名空间，与 subnet-manager/config.yaml 保持一致
+        nacos_group   subnet_mapping
+        nacos_data_id subnet_map
+        prefix_length 24
+    }
+
+    # 本地测试转发到公共 DNS；生产环境改为 PowerDNS Recursor 地址
+    forward . 114.114.114.114:53 {
+        force_tcp
+    }
+
+    prometheus :9153
+    log
+    errors
+}

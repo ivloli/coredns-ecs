@@ -1,0 +1,18 @@
+. {
+    ecs_normalizer {
+        ip2region_db  /data/ip2region/ip2region_v4.xdb
+        nacos_addr    nacos:8848
+        nacos_namespace coredns
+        nacos_group   subnet_mapping
+        nacos_data_id subnet_map
+        prefix_length 24
+    }
+
+    forward . 114.114.114.114:53 {
+        force_tcp
+    }
+
+    prometheus :9153
+    log
+    errors
+}
