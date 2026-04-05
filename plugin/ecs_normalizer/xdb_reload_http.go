@@ -64,7 +64,7 @@ func (e *ECSNormalizer) handleXDBReload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	bytes, err := e.reloadSearcherFromDisk()
+	bytesV4, bytesV6, err := e.reloadSearchersFromDisk()
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -74,37 +74,49 @@ func (e *ECSNormalizer) handleXDBReload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	log.Infof("xdb reload triggered via http: remote=%s path=%s bytes=%d", r.RemoteAddr, r.URL.Path, bytes)
+	log.Infof("xdb reload triggered via http: remote=%s path=%s bytes_v4=%d bytes_v6=%d", r.RemoteAddr, r.URL.Path, bytesV4, bytesV6)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":          true,
-		"xdb_path":    e.cfg.IP2RegionXDB,
-		"bytes":       bytes,
+		"xdb_v4_path": e.cfg.IP2RegionXDB,
+		"xdb_v6_path": e.cfg.IP2RegionXDBV6,
+		"bytes_v4":    bytesV4,
+		"bytes_v6":    bytesV6,
 		"reloaded_at": time.Now().Format(time.RFC3339),
 	})
 }
 
-func (e *ECSNormalizer) reloadSearcherFromDisk() (int, error) {
-	cBuff, err := xdb.LoadContentFromFile(e.cfg.IP2RegionXDB)
+func (e *ECSNormalizer) reloadSearchersFromDisk() (int, int, error) {
+	searcherV4, bytesV4, err := loadSearcherFromPath(e.cfg.IP2RegionXDB, xdb.IPv4)
 	if err != nil {
-		return 0, fmt.Errorf("load ip2region xdb: %w", err)
+		return 0, 0, fmt.Errorf("load ipv4 ip2region xdb: %w", err)
 	}
-	searcher, err := xdb.NewWithBuffer(xdb.IPv4, cBuff)
-	if err != nil {
-		return 0, fmt.Errorf("init searcher: %w", err)
+
+	var searcherV6 *xdb.Searcher
+	bytesV6 := 0
+	if e.cfg.IP2RegionXDBV6 != "" {
+		searcherV6, bytesV6, err = loadSearcherFromPath(e.cfg.IP2RegionXDBV6, xdb.IPv6)
+		if err != nil {
+			searcherV4.Close()
+			return 0, 0, fmt.Errorf("load ipv6 ip2region xdb: %w", err)
+		}
 	}
 
 	e.mu.Lock()
-	old := e.searcher
-	e.searcher = searcher
+	oldV4 := e.searcherV4
+	oldV6 := e.searcherV6
+	e.searcherV4 = searcherV4
+	e.searcherV6 = searcherV6
 	e.mu.Unlock()
 
-	if old != nil {
-		if closer, ok := any(old).(interface{ Close() error }); ok {
-			_ = closer.Close()
-		}
+	if oldV4 != nil {
+		oldV4.Close()
 	}
-	return len(cBuff), nil
+	if oldV6 != nil {
+		oldV6.Close()
+	}
+
+	return bytesV4, bytesV6, nil
 }
 
 func isLoopbackRemote(remoteAddr string) bool {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/nacos-group/nacos-sdk-go/v2/clients"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
@@ -42,18 +43,31 @@ func newNacosClient(cfg *Config) (config_client.IConfigClient, error) {
 	})
 }
 
-// loadSubnetMap fetches the current subnet map from Nacos and stores it in e.subnetMap.
-func (e *ECSNormalizer) loadSubnetMap(client config_client.IConfigClient) error {
+// loadSubnetMaps fetches subnet maps from Nacos for both IPv4 and IPv6.
+func (e *ECSNormalizer) loadSubnetMaps(client config_client.IConfigClient) error {
+	if err := e.loadSubnetMapByDataID(client, e.cfg.NacosDataID, &e.subnetMapV4, "v4"); err != nil {
+		return err
+	}
+	if e.cfg.NacosDataIDV6 != "" {
+		if err := e.loadSubnetMapByDataID(client, e.cfg.NacosDataIDV6, &e.subnetMapV6, "v6"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *ECSNormalizer) loadSubnetMapByDataID(client config_client.IConfigClient, dataID string, target *sync.Map, label string) error {
 	content, err := client.GetConfig(vo.ConfigParam{
-		DataId: e.cfg.NacosDataID,
+		DataId: dataID,
 		Group:  e.cfg.NacosGroup,
 	})
 	if err != nil {
-		return fmt.Errorf("get config (data_id=%s group=%s): %w", e.cfg.NacosDataID, e.cfg.NacosGroup, err)
+		return fmt.Errorf("get config (data_id=%s group=%s): %w", dataID, e.cfg.NacosGroup, err)
 	}
+	clearSyncMap(target)
 	if content == "" {
 		log.Warningf("nacos config is empty (data_id=%s group=%s) — will retry on next change",
-			e.cfg.NacosDataID, e.cfg.NacosGroup)
+			dataID, e.cfg.NacosGroup)
 		return nil
 	}
 	m := make(map[string]string)
@@ -61,36 +75,46 @@ func (e *ECSNormalizer) loadSubnetMap(client config_client.IConfigClient) error 
 		return fmt.Errorf("unmarshal nacos config: %w", err)
 	}
 	for k, v := range m {
-		e.subnetMap.Store(k, v)
+		target.Store(k, v)
 	}
-	log.Infof("loaded %d subnet mappings from nacos", len(m))
+	log.Infof("loaded %d subnet mappings from nacos (%s)", len(m), label)
 	return nil
 }
 
 // startNacosListener registers a change callback so the subnetMap is updated
 // whenever subnet-manager pushes a new config to Nacos.
 func (e *ECSNormalizer) startNacosListener(client config_client.IConfigClient) {
-	err := client.ListenConfig(vo.ConfigParam{
-		DataId: e.cfg.NacosDataID,
-		Group:  e.cfg.NacosGroup,
-		OnChange: func(_, _, _, data string) {
-			newMap := make(map[string]string)
-			if err := json.Unmarshal([]byte(data), &newMap); err != nil {
-				log.Errorf("failed to parse nacos config update: %v", err)
-				return
-			}
-			// Atomically swap subnetMap contents.
-			e.subnetMap.Range(func(k, _ any) bool {
-				e.subnetMap.Delete(k)
-				return true
-			})
-			for k, v := range newMap {
-				e.subnetMap.Store(k, v)
-			}
-			log.Infof("subnet map hot-updated: %d entries", len(newMap))
-		},
-	})
-	if err != nil {
-		log.Warningf("failed to register nacos config listener: %v", err)
+	register := func(dataID string, target *sync.Map, label string) {
+		err := client.ListenConfig(vo.ConfigParam{
+			DataId: dataID,
+			Group:  e.cfg.NacosGroup,
+			OnChange: func(_, _, _, data string) {
+				newMap := make(map[string]string)
+				if err := json.Unmarshal([]byte(data), &newMap); err != nil {
+					log.Errorf("failed to parse nacos config update (%s): %v", label, err)
+					return
+				}
+				clearSyncMap(target)
+				for k, v := range newMap {
+					target.Store(k, v)
+				}
+				log.Infof("subnet map hot-updated (%s): %d entries", label, len(newMap))
+			},
+		})
+		if err != nil {
+			log.Warningf("failed to register nacos config listener (%s): %v", label, err)
+		}
 	}
+
+	register(e.cfg.NacosDataID, &e.subnetMapV4, "v4")
+	if e.cfg.NacosDataIDV6 != "" {
+		register(e.cfg.NacosDataIDV6, &e.subnetMapV6, "v6")
+	}
+}
+
+func clearSyncMap(m *sync.Map) {
+	m.Range(func(k, _ any) bool {
+		m.Delete(k)
+		return true
+	})
 }

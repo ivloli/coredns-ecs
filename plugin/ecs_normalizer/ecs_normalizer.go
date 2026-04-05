@@ -3,6 +3,7 @@ package ecs_normalizer
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,10 +31,12 @@ type ECSNormalizer struct {
 	Next plugin.Handler
 	cfg  *Config
 
-	mu       sync.RWMutex
-	searcher *xdb.Searcher // ip2region in-memory searcher (protected by mu)
+	mu         sync.RWMutex
+	searcherV4 *xdb.Searcher // ip2region v4 in-memory searcher (protected by mu)
+	searcherV6 *xdb.Searcher // ip2region v6 in-memory searcher (protected by mu)
 
-	subnetMap          sync.Map         // "province|isp" → subnet CIDR string
+	subnetMapV4        sync.Map         // "province|isp" → subnet CIDR string
+	subnetMapV6        sync.Map         // "province|isp" → subnet CIDR string
 	dnsCache           *ristretto.Cache // DNS response cache
 	prefetchInFlight   sync.Map         // cacheKey -> struct{} (dedupe prefetch refresh)
 	cacheIndex         sync.Map         // cacheKey -> *cachedResponse (for active prefetch scan)
@@ -47,6 +50,7 @@ type cachedResponse struct {
 	province  string
 	isp       string
 	subnet    string
+	ipFamily  int
 	qname     string
 	qtype     uint16
 }
@@ -69,10 +73,13 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 		log.Infof("[%s] client_ip=%s (source=remote, no ecs subnet)", qname, clientIP)
 	}
 
+	ipFamily := detectIPFamily(clientIP)
+	if ipFamily == 0 {
+		return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
+	}
+
 	// 2. ip2region lookup.
-	e.mu.RLock()
-	regionStr, err := e.searcher.SearchByStr(clientIP)
-	e.mu.RUnlock()
+	regionStr, err := e.searchRegion(clientIP, ipFamily)
 	if err != nil || regionStr == "" {
 		log.Debugf("[%s] ip2region miss for %s, passthrough", qname, clientIP)
 		return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
@@ -88,7 +95,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 
 	// 3. Check DNS response cache.
 	qtype := r.Question[0].Qtype
-	cacheKey := cacheKeyFromMeta(province, isp, qname, qtype)
+	cacheKey := cacheKeyFromMeta(ipFamily, province, isp, qname, qtype)
 
 	if val, ok := e.dnsCache.Get(cacheKey); ok {
 		if cr, ok := val.(*cachedResponse); ok {
@@ -100,7 +107,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 				if e.cfg.CachePrefetchMode == "request" && e.cfg.CachePrefetchAhead > 0 && remaining <= e.cfg.CachePrefetchAhead {
 					if _, loaded := e.prefetchInFlight.LoadOrStore(cacheKey, struct{}{}); !loaded {
 						log.Infof("[%s] ristretto cache prefetch trigger: province=%s isp=%s qtype=%d remaining=%s", qname, province, isp, qtype, remaining.Round(time.Millisecond))
-						go e.prefetchCache(cacheKey, province, isp, qname, qtype)
+						go e.prefetchCache(cacheKey, ipFamily, province, isp, qname, qtype)
 					} else {
 						log.Infof("[%s] ristretto cache hit (prefetch in-flight): province=%s isp=%s qtype=%d", qname, province, isp, qtype)
 					}
@@ -115,10 +122,11 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	}
 
 	// 4. Look up fixed representative subnet.
-	subnetVal, ok := e.subnetMap.Load(province + "|" + isp)
+	subnetMap := e.subnetMapForFamily(ipFamily)
+	subnetVal, ok := subnetMap.Load(province + "|" + isp)
 	if !ok {
 		// No mapping in Nacos yet — passthrough.
-		log.Warningf("[%s] no subnet mapping for province=%s isp=%s, passthrough", qname, province, isp)
+		log.Warningf("[%s] no subnet mapping for ip_family=%d province=%s isp=%s, passthrough", qname, ipFamily, province, isp)
 		return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
 	}
 	subnet := subnetVal.(string)
@@ -148,6 +156,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 					province:  province,
 					isp:       isp,
 					subnet:    subnet,
+					ipFamily:  ipFamily,
 					qname:     qname,
 					qtype:     qtype,
 				}
@@ -159,12 +168,13 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	return rcode, nil
 }
 
-func (e *ECSNormalizer) prefetchCache(cacheKey, province, isp, qname string, qtype uint16) {
+func (e *ECSNormalizer) prefetchCache(cacheKey string, ipFamily int, province, isp, qname string, qtype uint16) {
 	defer e.prefetchInFlight.Delete(cacheKey)
 
-	subnetVal, ok := e.subnetMap.Load(province + "|" + isp)
+	subnetMap := e.subnetMapForFamily(ipFamily)
+	subnetVal, ok := subnetMap.Load(province + "|" + isp)
 	if !ok {
-		log.Warningf("[%s] prefetch skipped: no subnet mapping for province=%s isp=%s", qname, province, isp)
+		log.Warningf("[%s] prefetch skipped: no subnet mapping for ip_family=%d province=%s isp=%s", qname, ipFamily, province, isp)
 		return
 	}
 	subnet := subnetVal.(string)
@@ -207,6 +217,7 @@ func (e *ECSNormalizer) prefetchCache(cacheKey, province, isp, qname string, qty
 		province:  province,
 		isp:       isp,
 		subnet:    subnet,
+		ipFamily:  ipFamily,
 		qname:     qname,
 		qtype:     qtype,
 	}
@@ -222,15 +233,15 @@ func (e *ECSNormalizer) writeCache(cacheKey string, cr *cachedResponse, source s
 	}
 }
 
-func cacheKeyFromMeta(province, isp, qname string, qtype uint16) string {
-	return fmt.Sprintf("%s|%s|%s|%d", province, isp, qname, qtype)
+func cacheKeyFromMeta(ipFamily int, province, isp, qname string, qtype uint16) string {
+	return fmt.Sprintf("%d|%s|%s|%s|%d", ipFamily, province, isp, qname, qtype)
 }
 
 func cacheKeyFromCachedResponse(cr *cachedResponse) string {
 	if cr == nil {
 		return ""
 	}
-	return cacheKeyFromMeta(cr.province, cr.isp, cr.qname, cr.qtype)
+	return cacheKeyFromMeta(cr.ipFamily, cr.province, cr.isp, cr.qname, cr.qtype)
 }
 
 func (e *ECSNormalizer) onCacheEvict(item *ristretto.Item) {
@@ -301,7 +312,40 @@ func (e *ECSNormalizer) scanAndPrefetch() {
 			return true
 		}
 		log.Infof("[%s] active prefetch trigger: province=%s isp=%s qtype=%d remaining=%s", cr.qname, cr.province, cr.isp, cr.qtype, remaining.Round(time.Millisecond))
-		go e.prefetchCache(cacheKey, cr.province, cr.isp, cr.qname, cr.qtype)
+		go e.prefetchCache(cacheKey, cr.ipFamily, cr.province, cr.isp, cr.qname, cr.qtype)
 		return true
 	})
+}
+
+func detectIPFamily(ipStr string) int {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return 0
+	}
+	if ip.To4() != nil {
+		return 4
+	}
+	return 6
+}
+
+func (e *ECSNormalizer) searchRegion(ip string, ipFamily int) (string, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if ipFamily == 6 {
+		if e.searcherV6 == nil {
+			return "", nil
+		}
+		return e.searcherV6.SearchByStr(ip)
+	}
+	if e.searcherV4 == nil {
+		return "", nil
+	}
+	return e.searcherV4.SearchByStr(ip)
+}
+
+func (e *ECSNormalizer) subnetMapForFamily(ipFamily int) *sync.Map {
+	if ipFamily == 6 {
+		return &e.subnetMapV6
+	}
+	return &e.subnetMapV4
 }

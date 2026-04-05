@@ -67,12 +67,18 @@ func injectECS(r *dns.Msg, cidr string, prefixLength uint8) error {
 }
 
 // parseRegion parses ip2region SearchByStr result and returns normalized keys.
-// Input format: "国家|省份|城市|运营商|地区码"
-// e.g. "中国|广东省|广州市|中国电信|CN"
+// Supported formats:
+// - "中国|0|广东省|广州市|电信"
+// - "中国|广东省|广州市|中国电信|CN"
 // Output: ("广东", "电信")
 func parseRegion(regionStr string) (province, isp string) {
 	parts := strings.Split(regionStr, "|")
-	if len(parts) < 4 {
+	if len(parts) < 5 {
+		return
+	}
+	if strings.TrimSpace(parts[1]) == "0" {
+		province = normalizeProvince(strings.TrimSpace(parts[2]))
+		isp = normalizeISP(strings.TrimSpace(parts[4]))
 		return
 	}
 	province = normalizeProvince(strings.TrimSpace(parts[1]))

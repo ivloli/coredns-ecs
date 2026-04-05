@@ -1,10 +1,12 @@
 . {
     ecs_normalizer {
         ip2region_db  data/ip2region/ip2region_v4.xdb   # 相对于运行目录（项目根）
+        ip2region_db_v6 data/ip2region/ip2region_v6.xdb
         nacos_addr    localhost:8848
         # nacos_namespace 不写 = public 命名空间，与 subnet-manager/config.yaml 保持一致
         nacos_group   subnet_mapping
         nacos_data_id subnet_map
+        nacos_data_id_v6 subnet_map_v6
         prefix_length 24
     }
 

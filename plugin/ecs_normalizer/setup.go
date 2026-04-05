@@ -23,10 +23,12 @@ func init() {
 // Config holds Corefile options for the ecs_normalizer plugin.
 type Config struct {
 	IP2RegionXDB       string
+	IP2RegionXDBV6     string
 	NacosAddr          string
 	NacosNamespace     string
 	NacosGroup         string
 	NacosDataID        string
+	NacosDataIDV6      string
 	NacosUsername      string
 	NacosPassword      string
 	PrefixLength       uint8
@@ -45,19 +47,27 @@ func setup(c *caddy.Controller) error {
 	}
 
 	// Load ip2region XDB entirely into memory for lock-free concurrent reads.
-	cBuff, err := xdb.LoadContentFromFile(cfg.IP2RegionXDB)
+	searcherV4, bytesV4, err := loadSearcherFromPath(cfg.IP2RegionXDB, xdb.IPv4)
 	if err != nil {
-		return plugin.Error("ecs_normalizer", fmt.Errorf("load ip2region xdb: %w", err))
+		return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv4 ip2region xdb: %w", err))
 	}
-	searcher, err := xdb.NewWithBuffer(xdb.IPv4, cBuff)
-	if err != nil {
-		return plugin.Error("ecs_normalizer", fmt.Errorf("init searcher: %w", err))
+	log.Infof("ip2region v4 xdb loaded: %s (%d bytes)", cfg.IP2RegionXDB, bytesV4)
+
+	var searcherV6 *xdb.Searcher
+	if cfg.IP2RegionXDBV6 != "" {
+		searcherV6, _, err = loadSearcherFromPath(cfg.IP2RegionXDBV6, xdb.IPv6)
+		if err != nil {
+			return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv6 ip2region xdb: %w", err))
+		}
+		log.Infof("ip2region v6 xdb loaded: %s", cfg.IP2RegionXDBV6)
+	} else {
+		log.Warningf("ip2region_db_v6 not configured; ipv6 ecs normalization disabled")
 	}
-	log.Infof("ip2region xdb loaded: %s (%d bytes)", cfg.IP2RegionXDB, len(cBuff))
 
 	e := &ECSNormalizer{
-		cfg:      cfg,
-		searcher: searcher,
+		cfg:        cfg,
+		searcherV4: searcherV4,
+		searcherV6: searcherV6,
 	}
 
 	// Ristretto in-memory DNS response cache (province|isp|qname|qtype → response).
@@ -80,12 +90,12 @@ func setup(c *caddy.Controller) error {
 	if err != nil {
 		return plugin.Error("ecs_normalizer", fmt.Errorf("init nacos client: %w", err))
 	}
-	if err := e.loadSubnetMap(nacosClient); err != nil {
+	if err := e.loadSubnetMaps(nacosClient); err != nil {
 		return plugin.Error("ecs_normalizer", fmt.Errorf("load subnet map from nacos: %w", err))
 	}
 	e.startNacosListener(nacosClient)
-	log.Infof("ecs_normalizer ready: nacos=%s ns=%q group=%s data_id=%s prefix_len=/%d prefetch_mode=%s prefetch_ahead=%s prefetch_scan=%s cache_max_cost_mb=%d",
-		cfg.NacosAddr, cfg.NacosNamespace, cfg.NacosGroup, cfg.NacosDataID, cfg.PrefixLength, cfg.CachePrefetchMode, cfg.CachePrefetchAhead, cfg.CachePrefetchScan, cfg.CacheMaxCostMB)
+	log.Infof("ecs_normalizer ready: nacos=%s ns=%q group=%s data_id_v4=%s data_id_v6=%s prefix_len=/%d prefetch_mode=%s prefetch_ahead=%s prefetch_scan=%s cache_max_cost_mb=%d",
+		cfg.NacosAddr, cfg.NacosNamespace, cfg.NacosGroup, cfg.NacosDataID, cfg.NacosDataIDV6, cfg.PrefixLength, cfg.CachePrefetchMode, cfg.CachePrefetchAhead, cfg.CachePrefetchScan, cfg.CacheMaxCostMB)
 
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		e.Next = next
@@ -99,6 +109,7 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 	cfg := &Config{
 		NacosGroup:         "subnet_mapping",
 		NacosDataID:        "subnet_map",
+		NacosDataIDV6:      "subnet_map_v6",
 		PrefixLength:       24,
 		CachePrefetchAhead: 5 * time.Second,
 		CachePrefetchMode:  "request",
@@ -114,6 +125,11 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 					return nil, c.ArgErr()
 				}
 				cfg.IP2RegionXDB = c.Val()
+			case "ip2region_db_v6":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				cfg.IP2RegionXDBV6 = c.Val()
 			case "nacos_addr":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
@@ -134,6 +150,11 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 					return nil, c.ArgErr()
 				}
 				cfg.NacosDataID = c.Val()
+			case "nacos_data_id_v6":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				cfg.NacosDataIDV6 = c.Val()
 			case "nacos_username":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
@@ -220,4 +241,16 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 		return nil, fmt.Errorf("nacos_addr is required")
 	}
 	return cfg, nil
+}
+
+func loadSearcherFromPath(path string, version *xdb.Version) (*xdb.Searcher, int, error) {
+	cBuff, err := xdb.LoadContentFromFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	searcher, err := xdb.NewWithBuffer(version, cBuff)
+	if err != nil {
+		return nil, 0, err
+	}
+	return searcher, len(cBuff), nil
 }

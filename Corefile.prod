@@ -3,17 +3,19 @@
     errors
 
     forward . tls://139.159.195.20:10530 {
-        tls_servername b-f3.ufaei.com
+        tls_servername d.d.fgnlo.com
         policy sequential
         max_fails 2
     }
 
       ecs_normalizer {
           ip2region_db  /var/lib/coredns-ecs/ip2region/ip2region_v4.xdb
+          ip2region_db_v6 /var/lib/coredns-ecs/ip2region/ip2region_v6.xdb
           nacos_addr    139.159.195.20:8848
           nacos_namespace   scloud-prod
           nacos_group   subnet_mapping
           nacos_data_id subnet_map
+          nacos_data_id_v6 subnet_map_v6
           nacos_username scloud-admin
           nacos_password 2a958ec104323d2a9374675154d1a4fc
           prefix_length 24
@@ -37,17 +39,19 @@
     errors
 
     forward . tls://139.159.195.20:10530 {
-        tls_servername b-f3.ufaei.com
+        tls_servername d.d.fgnlo.com
         policy sequential
         max_fails 2
     }
 
       ecs_normalizer {
           ip2region_db  /var/lib/coredns-ecs/ip2region/ip2region_v4.xdb
+          ip2region_db_v6 /var/lib/coredns-ecs/ip2region/ip2region_v6.xdb
           nacos_addr    139.159.195.20:8848
           nacos_namespace   scloud-prod
           nacos_group   subnet_mapping
           nacos_data_id subnet_map
+          nacos_data_id_v6 subnet_map_v6
           nacos_username scloud-admin
           nacos_password 2a958ec104323d2a9374675154d1a4fc
           prefix_length 24
