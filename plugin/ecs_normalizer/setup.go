@@ -69,6 +69,7 @@ func setup(c *caddy.Controller) error {
 		searcherV4: searcherV4,
 		searcherV6: searcherV6,
 	}
+	registerMetrics()
 
 	// Ristretto in-memory DNS response cache (province|isp|qname|qtype → response).
 	cache, err := ristretto.NewCache(&ristretto.Config{

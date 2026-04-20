@@ -57,7 +57,13 @@ type cachedResponse struct {
 
 func (e *ECSNormalizer) Name() string { return "ecs_normalizer" }
 
-func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (rcode int, err error) {
+	start := time.Now()
+	cacheHit := false
+	defer func() {
+		e.observeRequestMetrics(time.Since(start), rcode, err, cacheHit)
+	}()
+
 	if len(r.Question) == 0 {
 		return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
 	}
@@ -115,6 +121,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 				log.Infof("[%s] ristretto cache hit: province=%s isp=%s qtype=%d", qname, province, isp, qtype)
 				resp := cr.msg.Copy()
 				resp.Id = r.Id
+				cacheHit = true
 				w.WriteMsg(resp)
 				return dns.RcodeSuccess, nil
 			}
@@ -141,7 +148,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 
 	// 6. Forward to next plugin.
 	rec := dnstest.NewRecorder(w)
-	rcode, err := plugin.NextOrFailure(e.Name(), e.Next, ctx, rec, rClone)
+	rcode, err = plugin.NextOrFailure(e.Name(), e.Next, ctx, rec, rClone)
 	if err != nil {
 		return rcode, err
 	}
