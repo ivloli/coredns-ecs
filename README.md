@@ -24,6 +24,8 @@ make release-package
 make release-checksum
 ```
 
+If Jenkins supplies a custom `Corefile`, pass it as `COREFILE_SRC=/path/to/Corefile` when running `make release-package` or `make install`.
+
 Custom tag:
 
 ```bash

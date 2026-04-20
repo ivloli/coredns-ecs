@@ -13,6 +13,7 @@ RELEASE_NAME := $(APP_NAME)-offline-$(TARGET_OS)-$(TARGET_ARCH)-$(RELEASE_TAG)
 RELEASE_PATH := $(RELEASE_DIR)/$(RELEASE_NAME)
 RELEASE_BIN := $(RELEASE_PATH)/$(APP_NAME)
 RELEASE_TAR := $(RELEASE_NAME).tar.gz
+COREFILE_SRC ?= Corefile
 
 PREFIX ?= /usr/local
 INSTALL_BIN := $(PREFIX)/bin/$(APP_NAME)
@@ -66,12 +67,12 @@ install:
 			echo "Installed $(IP2REGION_V6_XDB_NAME) from $(IP2REGION_V6_SRC_PATH)"; \
 		fi; \
 	fi
-	[ -f $(ETC_DIR)/Corefile ] || install -m 644 Corefile.prod $(ETC_DIR)/Corefile
+	install -m 644 "$(COREFILE_SRC)" $(ETC_DIR)/Corefile
 	install -m 644 coredns-ecs.service $(SERVICE_DIR)/coredns-ecs.service
 	install -m 644 coredns-ecs@.service $(SERVICE_DIR)/coredns-ecs@.service
 	for i in $(COREDNS_INSTANCES); do \
 		install -d -m 755 $(ETC_DIR)/$$i; \
-		[ -f $(ETC_DIR)/$$i/Corefile ] || install -m 644 Corefile.prod $(ETC_DIR)/$$i/Corefile; \
+		install -m 644 "$(COREFILE_SRC)" $(ETC_DIR)/$$i/Corefile; \
 	done
 	systemctl daemon-reload
 	systemctl enable coredns-ecs
@@ -115,7 +116,7 @@ multi-status:
 
 package:
 	@set -e; \
-	items="Makefile go.mod go.sum main.go directives.go plugin Corefile Corefile.prod Corefile.example coredns-ecs.service coredns-ecs@.service README.md"; \
+	items="Makefile go.mod go.sum main.go directives.go plugin Corefile Corefile.example coredns-ecs.service coredns-ecs@.service README.md"; \
 	if [ -d "$(IP2REGION_DIR_NAME)" ]; then items="$$items $(IP2REGION_DIR_NAME)"; fi; \
 	tar -czf $(APP_NAME)-standalone.tar.gz $$items
 	@echo "Created $(APP_NAME)-standalone.tar.gz"
@@ -125,7 +126,7 @@ prepare-release:
 
 build-release: prepare-release
 	GOWORK=off CGO_ENABLED=0 GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -o $(RELEASE_BIN) .
-	install -m 644 Corefile.prod $(RELEASE_PATH)/Corefile.prod
+	install -m 644 "$(COREFILE_SRC)" $(RELEASE_PATH)/Corefile
 	install -m 644 coredns-ecs.service $(RELEASE_PATH)/coredns-ecs.service
 	install -m 644 coredns-ecs@.service $(RELEASE_PATH)/coredns-ecs@.service
 	install -m 644 Makefile $(RELEASE_PATH)/Makefile
