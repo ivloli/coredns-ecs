@@ -1,4 +1,4 @@
-.PHONY: all build tidy install uninstall start stop restart status \
+.PHONY: all build test tidy install uninstall start stop restart status \
 	multi-enable multi-start multi-stop multi-restart multi-status package \
 	prepare-release build-release release-package release-checksum
 
@@ -35,6 +35,9 @@ build:
 	install -d -m 755 $(BIN_DIR)
 	GOWORK=off go build -o $(BIN_PATH) .
 	@echo "Built $(BIN_PATH)"
+
+test:
+	GOWORK=off go test ./...
 
 tidy:
 	GOWORK=off go mod tidy

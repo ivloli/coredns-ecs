@@ -40,6 +40,12 @@ pipeline {
             }
         }
 
+        stage('Build And Test') {
+            steps {
+                sh 'make test'
+            }
+        }
+
         stage('Build Release Package') {
             steps {
                 script {
