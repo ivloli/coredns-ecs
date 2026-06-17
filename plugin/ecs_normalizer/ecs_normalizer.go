@@ -44,6 +44,8 @@ type ECSNormalizer struct {
 	lastRejectWarnUnix atomic.Int64
 }
 
+const traceLogPrefix = "[ECS_TRACE]"
+
 type cachedResponse struct {
 	msg       *dns.Msg
 	expiresAt time.Time
@@ -74,9 +76,9 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	state := request.Request{W: w, Req: r}
 	clientIP, fromECS := extractClientIP(state, r)
 	if fromECS {
-		log.Infof("[%s] client_ip=%s (source=ecs)", qname, clientIP)
+		log.Infof("%s [%s] client_ip=%s (source=ecs)", traceLogPrefix, qname, clientIP)
 	} else {
-		log.Infof("[%s] client_ip=%s (source=remote, no ecs subnet)", qname, clientIP)
+		log.Infof("%s [%s] client_ip=%s (source=remote, no ecs subnet)", traceLogPrefix, qname, clientIP)
 	}
 
 	ipFamily := detectIPFamily(clientIP)
@@ -92,7 +94,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	}
 
 	province, isp := parseRegion(regionStr)
-	log.Infof("[%s] client=%s → province=%s isp=%s", qname, clientIP, province, isp)
+	log.Infof("%s [%s] client=%s → province=%s isp=%s", traceLogPrefix, qname, clientIP, province, isp)
 	if province == "" || isp == "" {
 		// Overseas or unknown — passthrough without ECS injection.
 		log.Debugf("[%s] unknown region, passthrough", qname)
@@ -112,13 +114,13 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 				remaining := time.Until(cr.expiresAt)
 				if e.cfg.CachePrefetchMode == "request" && e.cfg.CachePrefetchAhead > 0 && remaining <= e.cfg.CachePrefetchAhead {
 					if _, loaded := e.prefetchInFlight.LoadOrStore(cacheKey, struct{}{}); !loaded {
-						log.Infof("[%s] ristretto cache prefetch trigger: province=%s isp=%s qtype=%d remaining=%s", qname, province, isp, qtype, remaining.Round(time.Millisecond))
+						log.Infof("%s [%s] ristretto cache prefetch trigger: province=%s isp=%s qtype=%d remaining=%s", traceLogPrefix, qname, province, isp, qtype, remaining.Round(time.Millisecond))
 						go e.prefetchCache(cacheKey, ipFamily, province, isp, qname, qtype)
 					} else {
-						log.Infof("[%s] ristretto cache hit (prefetch in-flight): province=%s isp=%s qtype=%d", qname, province, isp, qtype)
+						log.Infof("%s [%s] ristretto cache hit (prefetch in-flight): key=%s province=%s isp=%s subnet=%s qtype=%d", traceLogPrefix, qname, cacheKey, province, isp, cr.subnet, qtype)
 					}
 				}
-				log.Infof("[%s] ristretto cache hit: province=%s isp=%s qtype=%d", qname, province, isp, qtype)
+				log.Infof("%s [%s] ristretto cache hit: key=%s province=%s isp=%s subnet=%s qtype=%d remaining=%s", traceLogPrefix, qname, cacheKey, province, isp, cr.subnet, qtype, remaining.Round(time.Millisecond))
 				resp := cr.msg.Copy()
 				resp.Id = r.Id
 				cacheHit = true
@@ -133,11 +135,11 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	subnetVal, ok := subnetMap.Load(province + "|" + isp)
 	if !ok {
 		// No mapping in Nacos yet — passthrough.
-		log.Warningf("[%s] no subnet mapping for ip_family=%d province=%s isp=%s, passthrough", qname, ipFamily, province, isp)
+		log.Warningf("%s [%s] no subnet mapping for ip_family=%d province=%s isp=%s, passthrough", traceLogPrefix, qname, ipFamily, province, isp)
 		return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
 	}
 	subnet := subnetVal.(string)
-	log.Infof("[%s] ECS injected: client=%s province=%s isp=%s → subnet=%s", qname, clientIP, province, isp, subnet)
+	log.Infof("%s [%s] ECS injected: client=%s province=%s isp=%s → subnet=%s", traceLogPrefix, qname, clientIP, province, isp, subnet)
 
 	// 5. Clone request and inject ECS.
 	rClone := r.Copy()
@@ -147,6 +149,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	}
 
 	// 6. Forward to next plugin.
+	log.Infof("%s [%s] forward upstream with ecs subnet=%s cache_key=%s", traceLogPrefix, qname, subnet, cacheKey)
 	rec := dnstest.NewRecorder(w)
 	rcode, err = plugin.NextOrFailure(e.Name(), e.Next, ctx, rec, rClone)
 	if err != nil {
@@ -236,7 +239,7 @@ func (e *ECSNormalizer) writeCache(cacheKey string, cr *cachedResponse, source s
 	if e.dnsCache.Set(cacheKey, cr, int64(len(packed))) {
 		e.cacheIndex.Store(cacheKey, cr)
 		ttl := uint32(time.Until(cr.expiresAt).Seconds())
-		log.Infof("[%s] ristretto cache %s write: province=%s isp=%s subnet=%s qtype=%d ttl=%d", cr.qname, source, cr.province, cr.isp, cr.subnet, cr.qtype, ttl)
+		log.Infof("%s [%s] ristretto cache %s write: key=%s province=%s isp=%s subnet=%s qtype=%d ttl=%d", traceLogPrefix, cr.qname, source, cacheKey, cr.province, cr.isp, cr.subnet, cr.qtype, ttl)
 	}
 }
 
