@@ -117,10 +117,10 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 						log.Infof("%s [%s] ristretto cache prefetch trigger: province=%s isp=%s qtype=%d remaining=%s", traceLogPrefix, qname, province, isp, qtype, remaining.Round(time.Millisecond))
 						go e.prefetchCache(cacheKey, ipFamily, province, isp, qname, qtype)
 					} else {
-						log.Infof("%s [%s] ristretto cache hit (prefetch in-flight): key=%s province=%s isp=%s subnet=%s qtype=%d", traceLogPrefix, qname, cacheKey, province, isp, cr.subnet, qtype)
+						log.Infof("%s [%s] ristretto cache hit (prefetch in-flight): client_ip=%s key=%s province=%s isp=%s subnet=%s qtype=%d", traceLogPrefix, qname, clientIP, cacheKey, province, isp, cr.subnet, qtype)
 					}
 				}
-				log.Infof("%s [%s] ristretto cache hit: key=%s province=%s isp=%s subnet=%s qtype=%d remaining=%s", traceLogPrefix, qname, cacheKey, province, isp, cr.subnet, qtype, remaining.Round(time.Millisecond))
+				log.Infof("%s [%s] ristretto cache hit: client_ip=%s key=%s province=%s isp=%s subnet=%s qtype=%d remaining=%s", traceLogPrefix, qname, clientIP, cacheKey, province, isp, cr.subnet, qtype, remaining.Round(time.Millisecond))
 				resp := cr.msg.Copy()
 				resp.Id = r.Id
 				cacheHit = true
