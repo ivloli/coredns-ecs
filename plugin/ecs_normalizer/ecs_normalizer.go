@@ -21,12 +21,12 @@ import (
 //
 // Flow per request:
 //  1. Extract client IP from ECS option (or fallback to connection IP).
-//  2. ip2region lookup → province + ISP.
-//  3. Check Ristretto DNS response cache (province|isp|qname|qtype).
-//  4. If miss: look up fixed subnet from Nacos-loaded sync.Map.
-//  5. Inject/overwrite ECS option with the representative subnet.
-//  6. Forward to next plugin (forward → PowerDNS).
-//  7. Cache DNS response in Ristretto; return to client.
+//  2. If convergence disabled: cache/forward with original ECS untouched.
+//  3. Otherwise ip2region lookup → province + ISP.
+//  4. Check Ristretto DNS response cache.
+//  5. If miss: look up fixed representative subnet from Nacos-loaded sync.Map.
+//  6. Inject/overwrite ECS option with the representative subnet.
+//  7. Forward to next plugin (forward → PowerDNS), cache response, return.
 type ECSNormalizer struct {
 	Next plugin.Handler
 	cfg  *Config
@@ -74,9 +74,9 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 
 	// 1. Extract client IP (prefer ECS option source address).
 	state := request.Request{W: w, Req: r}
-	clientIP, fromECS := extractClientIP(state, r)
+	clientIP, clientSubnet, fromECS := extractClientIP(state, r)
 	if fromECS {
-		log.Infof("%s [%s] client_ip=%s (source=ecs)", traceLogPrefix, qname, clientIP)
+		log.Infof("%s [%s] client_ip=%s client_subnet=%s (source=ecs)", traceLogPrefix, qname, clientIP, clientSubnet)
 	} else {
 		log.Infof("%s [%s] client_ip=%s (source=remote, no ecs subnet)", traceLogPrefix, qname, clientIP)
 	}
@@ -84,6 +84,58 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	ipFamily := detectIPFamily(clientIP)
 	if ipFamily == 0 {
 		return plugin.NextOrFailure(e.Name(), e.Next, ctx, w, r)
+	}
+
+	qtype := r.Question[0].Qtype
+
+	if !e.cfg.EnableConvergence {
+		cacheKey := passthroughCacheKey(ipFamily, clientSubnet, qname, qtype)
+		if val, ok := e.dnsCache.Get(cacheKey); ok {
+			if cr, ok := val.(*cachedResponse); ok {
+				if !time.Now().Before(cr.expiresAt) {
+					e.dnsCache.Del(cacheKey)
+					e.cacheIndex.Delete(cacheKey)
+				} else {
+					remaining := time.Until(cr.expiresAt)
+					log.Infof("%s [%s] passthrough cache hit: client_ip=%s client_subnet=%s key=%s qtype=%d remaining=%s", traceLogPrefix, qname, clientIP, clientSubnet, cacheKey, qtype, remaining.Round(time.Millisecond))
+					resp := cr.msg.Copy()
+					resp.Id = r.Id
+					cacheHit = true
+					w.WriteMsg(resp)
+					return dns.RcodeSuccess, nil
+				}
+			}
+		}
+
+		rClone := r.Copy()
+		if fromECS {
+			log.Infof("%s [%s] passthrough upstream with original ecs subnet=%s cache_key=%s", traceLogPrefix, qname, clientSubnet, cacheKey)
+		} else {
+			log.Infof("%s [%s] passthrough upstream without ecs cache_key=%s", traceLogPrefix, qname, cacheKey)
+		}
+
+		rec := dnstest.NewRecorder(w)
+		rcode, err = plugin.NextOrFailure(e.Name(), e.Next, ctx, rec, rClone)
+		if err != nil {
+			return rcode, err
+		}
+		if rec.Msg != nil {
+			if len(rec.Msg.Answer) > 0 {
+				if ttl := getMinTTL(rec.Msg); ttl > 0 {
+					cr := &cachedResponse{
+						msg:       rec.Msg.Copy(),
+						expiresAt: time.Now().Add(time.Duration(ttl) * time.Second),
+						subnet:    clientSubnet,
+						ipFamily:  ipFamily,
+						qname:     qname,
+						qtype:     qtype,
+					}
+					e.writeCache(cacheKey, cr, "passthrough")
+				}
+			}
+			w.WriteMsg(rec.Msg)
+		}
+		return rcode, nil
 	}
 
 	// 2. ip2region lookup.
@@ -102,7 +154,6 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	}
 
 	// 3. Check DNS response cache.
-	qtype := r.Question[0].Qtype
 	cacheKey := cacheKeyFromMeta(ipFamily, province, isp, qname, qtype)
 
 	if val, ok := e.dnsCache.Get(cacheKey); ok {
@@ -247,6 +298,13 @@ func cacheKeyFromMeta(ipFamily int, province, isp, qname string, qtype uint16) s
 	return fmt.Sprintf("%d|%s|%s|%s|%d", ipFamily, province, isp, qname, qtype)
 }
 
+func passthroughCacheKey(ipFamily int, clientSubnet, qname string, qtype uint16) string {
+	if clientSubnet == "" {
+		clientSubnet = "no_ecs"
+	}
+	return fmt.Sprintf("%d|passthrough|%s|%s|%d", ipFamily, clientSubnet, qname, qtype)
+}
+
 func cacheKeyFromCachedResponse(cr *cachedResponse) string {
 	if cr == nil {
 		return ""
@@ -279,6 +337,9 @@ func (e *ECSNormalizer) onCacheReject(item *ristretto.Item) {
 }
 
 func (e *ECSNormalizer) startActivePrefetchLoop() {
+	if !e.cfg.EnableConvergence {
+		return
+	}
 	if e.cfg.CachePrefetchMode != "active" {
 		return
 	}

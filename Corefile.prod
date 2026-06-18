@@ -18,6 +18,7 @@
           nacos_data_id_v6 subnet_map_v6
           nacos_username scloud-admin
           nacos_password 2a958ec104323d2a9374675154d1a4fc
+          enable_convergence false
           prefix_length 24
           # Prefetch strategy
           cache_prefetch_mode  active   # request | active
@@ -54,6 +55,7 @@
           nacos_data_id_v6 subnet_map_v6
           nacos_username scloud-admin
           nacos_password 2a958ec104323d2a9374675154d1a4fc
+          enable_convergence false
           prefix_length 24
           # Prefetch strategy
           cache_prefetch_mode  active   # request | active

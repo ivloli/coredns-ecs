@@ -9,17 +9,22 @@ import (
 	"github.com/miekg/dns"
 )
 
-// extractClientIP returns the IP to use for region lookup and whether it came from ECS.
-// Priority: ECS source address > connection remote IP.
-func extractClientIP(state request.Request, r *dns.Msg) (ip string, fromECS bool) {
+// extractClientIP returns the IP to use for region lookup, the ECS CIDR string,
+// and whether it came from ECS. Priority: ECS source address > connection remote IP.
+func extractClientIP(state request.Request, r *dns.Msg) (ip, subnet string, fromECS bool) {
 	if opt := r.IsEdns0(); opt != nil {
 		for _, o := range opt.Option {
 			if ecs, ok := o.(*dns.EDNS0_SUBNET); ok && ecs.Address != nil {
-				return ecs.Address.String(), true
+				ones := int(ecs.SourceNetmask)
+				bits := 128
+				if ecs.Family == 1 {
+					bits = 32
+				}
+				return ecs.Address.String(), (&net.IPNet{IP: ecs.Address, Mask: net.CIDRMask(ones, bits)}).String(), true
 			}
 		}
 	}
-	return state.IP(), false
+	return state.IP(), "", false
 }
 
 // injectECS sets (or replaces) the EDNS0_SUBNET option in r with the given subnet.

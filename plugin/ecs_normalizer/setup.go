@@ -31,6 +31,7 @@ type Config struct {
 	NacosDataIDV6      string
 	NacosUsername      string
 	NacosPassword      string
+	EnableConvergence  bool
 	PrefixLength       uint8
 	CachePrefetchAhead time.Duration
 	CachePrefetchMode  string
@@ -46,22 +47,26 @@ func setup(c *caddy.Controller) error {
 		return plugin.Error("ecs_normalizer", err)
 	}
 
-	// Load ip2region XDB entirely into memory for lock-free concurrent reads.
-	searcherV4, bytesV4, err := loadSearcherFromPath(cfg.IP2RegionXDB, xdb.IPv4)
-	if err != nil {
-		return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv4 ip2region xdb: %w", err))
-	}
-	log.Infof("ip2region v4 xdb loaded: %s (%d bytes)", cfg.IP2RegionXDB, bytesV4)
-
+	var searcherV4 *xdb.Searcher
 	var searcherV6 *xdb.Searcher
-	if cfg.IP2RegionXDBV6 != "" {
-		searcherV6, _, err = loadSearcherFromPath(cfg.IP2RegionXDBV6, xdb.IPv6)
+	if cfg.EnableConvergence {
+		// Load ip2region XDB entirely into memory for lock-free concurrent reads.
+		var bytesV4 int
+		searcherV4, bytesV4, err = loadSearcherFromPath(cfg.IP2RegionXDB, xdb.IPv4)
 		if err != nil {
-			return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv6 ip2region xdb: %w", err))
+			return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv4 ip2region xdb: %w", err))
 		}
-		log.Infof("ip2region v6 xdb loaded: %s", cfg.IP2RegionXDBV6)
-	} else {
-		log.Warningf("ip2region_db_v6 not configured; ipv6 ecs normalization disabled")
+		log.Infof("ip2region v4 xdb loaded: %s (%d bytes)", cfg.IP2RegionXDB, bytesV4)
+
+		if cfg.IP2RegionXDBV6 != "" {
+			searcherV6, _, err = loadSearcherFromPath(cfg.IP2RegionXDBV6, xdb.IPv6)
+			if err != nil {
+				return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv6 ip2region xdb: %w", err))
+			}
+			log.Infof("ip2region v6 xdb loaded: %s", cfg.IP2RegionXDBV6)
+		} else {
+			log.Warningf("ip2region_db_v6 not configured; ipv6 ecs normalization disabled")
+		}
 	}
 
 	e := &ECSNormalizer{
@@ -87,16 +92,18 @@ func setup(c *caddy.Controller) error {
 		return plugin.Error("ecs_normalizer", fmt.Errorf("start xdb reload http endpoint: %w", err))
 	}
 
-	nacosClient, err := newNacosClient(cfg)
-	if err != nil {
-		return plugin.Error("ecs_normalizer", fmt.Errorf("init nacos client: %w", err))
+	if cfg.EnableConvergence {
+		nacosClient, err := newNacosClient(cfg)
+		if err != nil {
+			return plugin.Error("ecs_normalizer", fmt.Errorf("init nacos client: %w", err))
+		}
+		if err := e.loadSubnetMaps(nacosClient); err != nil {
+			return plugin.Error("ecs_normalizer", fmt.Errorf("load subnet map from nacos: %w", err))
+		}
+		e.startNacosListener(nacosClient)
 	}
-	if err := e.loadSubnetMaps(nacosClient); err != nil {
-		return plugin.Error("ecs_normalizer", fmt.Errorf("load subnet map from nacos: %w", err))
-	}
-	e.startNacosListener(nacosClient)
-	log.Infof("ecs_normalizer ready: nacos=%s ns=%q group=%s data_id_v4=%s data_id_v6=%s prefix_len=/%d prefetch_mode=%s prefetch_ahead=%s prefetch_scan=%s cache_max_cost_mb=%d",
-		cfg.NacosAddr, cfg.NacosNamespace, cfg.NacosGroup, cfg.NacosDataID, cfg.NacosDataIDV6, cfg.PrefixLength, cfg.CachePrefetchMode, cfg.CachePrefetchAhead, cfg.CachePrefetchScan, cfg.CacheMaxCostMB)
+	log.Infof("ecs_normalizer ready: nacos=%s ns=%q group=%s data_id_v4=%s data_id_v6=%s enable_convergence=%t prefix_len=/%d prefetch_mode=%s prefetch_ahead=%s prefetch_scan=%s cache_max_cost_mb=%d",
+		cfg.NacosAddr, cfg.NacosNamespace, cfg.NacosGroup, cfg.NacosDataID, cfg.NacosDataIDV6, cfg.EnableConvergence, cfg.PrefixLength, cfg.CachePrefetchMode, cfg.CachePrefetchAhead, cfg.CachePrefetchScan, cfg.CacheMaxCostMB)
 
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		e.Next = next
@@ -111,6 +118,7 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 		NacosGroup:         "subnet_mapping",
 		NacosDataID:        "subnet_map",
 		NacosDataIDV6:      "subnet_map_v6",
+		EnableConvergence:  true,
 		PrefixLength:       24,
 		CachePrefetchAhead: 5 * time.Second,
 		CachePrefetchMode:  "request",
@@ -166,6 +174,15 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 					return nil, c.ArgErr()
 				}
 				cfg.NacosPassword = c.Val()
+			case "enable_convergence":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				b, err := strconv.ParseBool(c.Val())
+				if err != nil {
+					return nil, fmt.Errorf("invalid enable_convergence %q: %w", c.Val(), err)
+				}
+				cfg.EnableConvergence = b
 			case "prefix_length":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
@@ -235,11 +252,11 @@ func parseConfig(c *caddy.Controller) (*Config, error) {
 			}
 		}
 	}
-	if cfg.IP2RegionXDB == "" {
-		return nil, fmt.Errorf("ip2region_db is required")
+	if cfg.EnableConvergence && cfg.IP2RegionXDB == "" {
+		return nil, fmt.Errorf("ip2region_db is required when enable_convergence=true")
 	}
-	if cfg.NacosAddr == "" {
-		return nil, fmt.Errorf("nacos_addr is required")
+	if cfg.EnableConvergence && cfg.NacosAddr == "" {
+		return nil, fmt.Errorf("nacos_addr is required when enable_convergence=true")
 	}
 	return cfg, nil
 }
