@@ -49,24 +49,23 @@ func setup(c *caddy.Controller) error {
 
 	var searcherV4 *xdb.Searcher
 	var searcherV6 *xdb.Searcher
-	if cfg.EnableConvergence {
-		// Load ip2region XDB entirely into memory for lock-free concurrent reads.
+	if cfg.IP2RegionXDB != "" {
 		var bytesV4 int
 		searcherV4, bytesV4, err = loadSearcherFromPath(cfg.IP2RegionXDB, xdb.IPv4)
 		if err != nil {
 			return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv4 ip2region xdb: %w", err))
 		}
 		log.Infof("ip2region v4 xdb loaded: %s (%d bytes)", cfg.IP2RegionXDB, bytesV4)
+	}
 
-		if cfg.IP2RegionXDBV6 != "" {
-			searcherV6, _, err = loadSearcherFromPath(cfg.IP2RegionXDBV6, xdb.IPv6)
-			if err != nil {
-				return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv6 ip2region xdb: %w", err))
-			}
-			log.Infof("ip2region v6 xdb loaded: %s", cfg.IP2RegionXDBV6)
-		} else {
-			log.Warningf("ip2region_db_v6 not configured; ipv6 ecs normalization disabled")
+	if cfg.IP2RegionXDBV6 != "" {
+		searcherV6, _, err = loadSearcherFromPath(cfg.IP2RegionXDBV6, xdb.IPv6)
+		if err != nil {
+			return plugin.Error("ecs_normalizer", fmt.Errorf("load ipv6 ip2region xdb: %w", err))
 		}
+		log.Infof("ip2region v6 xdb loaded: %s", cfg.IP2RegionXDBV6)
+	} else if cfg.EnableConvergence {
+		log.Warningf("ip2region_db_v6 not configured; ipv6 ecs normalization disabled")
 	}
 
 	e := &ECSNormalizer{

@@ -52,6 +52,7 @@ type cachedResponse struct {
 	province  string
 	isp       string
 	subnet    string
+	fromECS   bool
 	ipFamily  int
 	qname     string
 	qtype     uint16
@@ -89,6 +90,13 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 	qtype := r.Question[0].Qtype
 
 	if !e.cfg.EnableConvergence {
+		if regionStr, regionErr := e.searchRegion(clientIP, ipFamily); regionErr == nil && regionStr != "" {
+			province, isp := parseRegion(regionStr)
+			if province != "" || isp != "" {
+				log.Infof("%s [%s] observed client=%s -> province=%s isp=%s (not used for routing)", traceLogPrefix, qname, clientIP, province, isp)
+			}
+		}
+
 		cacheKey := passthroughCacheKey(ipFamily, clientSubnet, qname, qtype)
 		if val, ok := e.dnsCache.Get(cacheKey); ok {
 			if cr, ok := val.(*cachedResponse); ok {
@@ -97,6 +105,14 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 					e.cacheIndex.Delete(cacheKey)
 				} else {
 					remaining := time.Until(cr.expiresAt)
+					if e.cfg.CachePrefetchMode == "request" && e.cfg.CachePrefetchAhead > 0 && remaining <= e.cfg.CachePrefetchAhead {
+						if _, loaded := e.prefetchInFlight.LoadOrStore(cacheKey, struct{}{}); !loaded {
+							log.Infof("%s [%s] passthrough cache prefetch trigger: client_ip=%s client_subnet=%s qtype=%d remaining=%s", traceLogPrefix, qname, clientIP, clientSubnet, qtype, remaining.Round(time.Millisecond))
+							go e.prefetchPassthroughCache(cacheKey, ipFamily, qname, qtype, clientSubnet, fromECS)
+						} else {
+							log.Infof("%s [%s] passthrough cache hit (prefetch in-flight): client_ip=%s client_subnet=%s key=%s qtype=%d", traceLogPrefix, qname, clientIP, clientSubnet, cacheKey, qtype)
+						}
+					}
 					log.Infof("%s [%s] passthrough cache hit: client_ip=%s client_subnet=%s key=%s qtype=%d remaining=%s", traceLogPrefix, qname, clientIP, clientSubnet, cacheKey, qtype, remaining.Round(time.Millisecond))
 					resp := cr.msg.Copy()
 					resp.Id = r.Id
@@ -126,6 +142,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 						msg:       rec.Msg.Copy(),
 						expiresAt: time.Now().Add(time.Duration(ttl) * time.Second),
 						subnet:    clientSubnet,
+						fromECS:   fromECS,
 						ipFamily:  ipFamily,
 						qname:     qname,
 						qtype:     qtype,
@@ -217,6 +234,7 @@ func (e *ECSNormalizer) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *d
 					province:  province,
 					isp:       isp,
 					subnet:    subnet,
+					fromECS:   true,
 					ipFamily:  ipFamily,
 					qname:     qname,
 					qtype:     qtype,
@@ -278,11 +296,61 @@ func (e *ECSNormalizer) prefetchCache(cacheKey string, ipFamily int, province, i
 		province:  province,
 		isp:       isp,
 		subnet:    subnet,
+		fromECS:   true,
 		ipFamily:  ipFamily,
 		qname:     qname,
 		qtype:     qtype,
 	}
 	e.writeCache(cacheKey, cr, "prefetch")
+}
+
+func (e *ECSNormalizer) prefetchPassthroughCache(cacheKey string, ipFamily int, qname string, qtype uint16, clientSubnet string, fromECS bool) {
+	defer e.prefetchInFlight.Delete(cacheKey)
+
+	r := new(dns.Msg)
+	r.SetQuestion(qname, qtype)
+	r.RecursionDesired = true
+	if fromECS {
+		if err := injectECS(r, clientSubnet, 0); err != nil {
+			log.Warningf("%s [%s] passthrough prefetch inject ECS failed (subnet=%s): %v", traceLogPrefix, qname, clientSubnet, err)
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pw := &prefetchWriter{}
+	rcode, err := plugin.NextOrFailure(e.Name(), e.Next, ctx, pw, r)
+	if err != nil {
+		log.Warningf("%s [%s] passthrough prefetch downstream query failed: %v", traceLogPrefix, qname, err)
+		return
+	}
+	if rcode != dns.RcodeSuccess {
+		log.Warningf("%s [%s] passthrough prefetch downstream rcode=%d", traceLogPrefix, qname, rcode)
+		return
+	}
+
+	msg := pw.Msg()
+	if msg == nil || len(msg.Answer) == 0 {
+		log.Debugf("[%s] passthrough prefetch no answer, skip cache refresh", qname)
+		return
+	}
+	ttl := getMinTTL(msg)
+	if ttl == 0 {
+		return
+	}
+
+	cr := &cachedResponse{
+		msg:       msg.Copy(),
+		expiresAt: time.Now().Add(time.Duration(ttl) * time.Second),
+		subnet:    clientSubnet,
+		fromECS:   fromECS,
+		ipFamily:  ipFamily,
+		qname:     qname,
+		qtype:     qtype,
+	}
+	e.writeCache(cacheKey, cr, "passthrough-prefetch")
 }
 
 func (e *ECSNormalizer) writeCache(cacheKey string, cr *cachedResponse, source string) {
@@ -308,6 +376,9 @@ func passthroughCacheKey(ipFamily int, clientSubnet, qname string, qtype uint16)
 func cacheKeyFromCachedResponse(cr *cachedResponse) string {
 	if cr == nil {
 		return ""
+	}
+	if cr.province == "" && cr.isp == "" {
+		return passthroughCacheKey(cr.ipFamily, cr.subnet, cr.qname, cr.qtype)
 	}
 	return cacheKeyFromMeta(cr.ipFamily, cr.province, cr.isp, cr.qname, cr.qtype)
 }
@@ -337,9 +408,6 @@ func (e *ECSNormalizer) onCacheReject(item *ristretto.Item) {
 }
 
 func (e *ECSNormalizer) startActivePrefetchLoop() {
-	if !e.cfg.EnableConvergence {
-		return
-	}
 	if e.cfg.CachePrefetchMode != "active" {
 		return
 	}
@@ -380,6 +448,11 @@ func (e *ECSNormalizer) scanAndPrefetch() {
 			return true
 		}
 		if _, loaded := e.prefetchInFlight.LoadOrStore(cacheKey, struct{}{}); loaded {
+			return true
+		}
+		if cr.province == "" && cr.isp == "" {
+			log.Infof("%s [%s] passthrough active prefetch trigger: subnet=%s qtype=%d remaining=%s", traceLogPrefix, cr.qname, cr.subnet, cr.qtype, remaining.Round(time.Millisecond))
+			go e.prefetchPassthroughCache(cacheKey, cr.ipFamily, cr.qname, cr.qtype, cr.subnet, cr.fromECS)
 			return true
 		}
 		log.Infof("[%s] active prefetch trigger: province=%s isp=%s qtype=%d remaining=%s", cr.qname, cr.province, cr.isp, cr.qtype, remaining.Round(time.Millisecond))
